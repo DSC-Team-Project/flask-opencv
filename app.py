@@ -1,4 +1,4 @@
-from flask import Flask, render_template,send_file, jsonify,Response
+from flask import Flask, render_template, send_file, Response
 import cv2
 import dlib
 from scipy.spatial import distance
@@ -6,12 +6,27 @@ import time
 import pyaudio
 import wave
 from flask_cors import CORS
-
+from threading import Timer
+from datetime import datetime  # 수정된 import 문
+import base64
+import numpy as np
+from flask_socketio import SocketIO
 
 app = Flask(__name__)
-CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+    
 
 frame = None
+lastsave = time.time()  # Initialize lastsave
 
 def calculate_EAR(eye):
     A = distance.euclidean(eye[1], eye[5])
@@ -21,24 +36,14 @@ def calculate_EAR(eye):
     return ear_aspect_ratio
 
 cap = cv2.VideoCapture(0)
-cap.set(3, 640)
-cap.set(4, 480)
+if not cap.isOpened():
+    print("Error: Could not open camera.")
+
 
 hog_face_detector = dlib.get_frontal_face_detector()
 dlib_facelandmark = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
-def counter(func):
-    def wrapper(*args, **kwargs):
-        wrapper.count += 1
-        time.sleep(0.05)
-        global lastsave
-        if time.time() - lastsave > 5:
-            lastsave = time.time()
-            wrapper.count = 0
-        return func(*args, **kwargs)
-    wrapper.count = 0
-    return wrapper
-
+# Define constants for audio playback
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
@@ -46,13 +51,16 @@ RATE = 44100
 WAVE_FILENAME = "wa.wav"
 
 p = pyaudio.PyAudio()
-wf = wave.open(WAVE_FILENAME, 'rb')
-stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
-                channels=wf.getnchannels(),
-                rate=wf.getframerate(),
-                output=True)
 
+# Define global variables for drowsiness detection
+drowsiness_duration = 0
+drowsiness_timer = None
+
+
+@socketio.on('play_alarm_event')  # New event for playing alarm
 def play_alarm():
+    global drowsiness_duration
+    
     wf = wave.open(WAVE_FILENAME, 'rb')
     stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
                     channels=wf.getnchannels(),
@@ -60,35 +68,62 @@ def play_alarm():
                     output=True)
 
     data = wf.readframes(CHUNK)
-    while data:
+    while data and drowsiness_duration < 15:  # Play for up to 15 seconds
         stream.write(data)
         data = wf.readframes(CHUNK)
+        drowsiness_duration += 0.05  # Increment the duration
+        time.sleep(0.05)
 
     stream.stop_stream()
     stream.close()
     wf.close()
 
+    # test
+    print('Playing alarm')
+    # You can add more logic here if needed
+    socketio.emit('alarm_played', {'status': 'Alarm played successfully'})
+
+def stop_alarm():
+    global drowsiness_duration
+    
+    # Reset the drowsiness duration
+    drowsiness_duration = 0
+    print("Driver is awake now")
+
+def counter(func):
+    def wrapper(*args, **kwargs):
+        wrapper.count += 1
+        time.sleep(0.05)
+        global frame, lastsave, drowsiness_duration, drowsiness_timer
+        if time.time() - lastsave > 5:
+            lastsave = time.time()
+            wrapper.count = 0
+            # Reset drowsiness duration when no drowsiness is detected
+            drowsiness_duration = 0
+            if drowsiness_timer and drowsiness_timer.is_alive():
+                drowsiness_timer.cancel()
+        return func(*args, **kwargs)
+    wrapper.count = 0
+    return wrapper
+
 @counter
 def close():
     global lastsave
-    
     print(frame)
-    cv2.putText(frame, "DROWSY", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 4)
 
-lastsave = time.time()
+@app.route('/sleep_image')
+def get_drowsiness_image():
+    # Provide the correct path to the saved drowsiness image
+    image_path = './static/drowst_image.jpg'
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+    with open(image_path, "rb") as image_file:
+        encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
 
-@app.route('/get_image', methods=['POST'])
-def get_image():
-    image_path = 'static/drowst_image.jpg'  # 이미지 파일의 경로
-    return send_file(image_path, mimetype='image/jpeg')
+    return {'image': encoded_image}
 
-@app.route('/signup',methods=['GET','POST'])
-def signup_page():
-    return render_template('index2.html')
+
+
+
 
 @app.route('/video_feed')
 def video_feed():
@@ -97,10 +132,10 @@ def video_feed():
         while True:
             _, frame = cap.read()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
+            
             faces = hog_face_detector(gray)
-            for face in faces:
 
+            for face in faces:
                 face_landmarks = dlib_facelandmark(gray, face)
                 leftEye = []
                 rightEye = []
@@ -132,29 +167,30 @@ def video_feed():
 
                 EAR = (left_ear + right_ear) / 2
                 EAR = round(EAR, 2)
-
+                
                 if EAR < 0.15:
                     close()
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     print(f'close count : {close.count}')
                     if close.count == 15:
+                       
                         print("Driver is sleeping")
                         play_alarm()
-                        save_path='static/drowst_image.jpg'
+                        save_path = './static/drowst_image.jpg'
+                        cv2.putText(frame, f"Current Time: {current_time}", (20, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2) 
+                        cv2.putText(frame, "DROWSY", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 4)
                         print(f'Image saved: {save_path}')
                         cv2.imwrite(save_path, frame)
+
                 print(EAR)
 
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            frame_bytes = jpeg.tobytes()
+            jpeg = cv2.imencode('.jpg', frame)[1].tobytes()
+            frame_bytes = jpeg
             yield (b'--frame\r\n'
-                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n\r\n')
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n\r\n')
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    app.run(debug=True)
-
-
-cap.release()
-cv2.destroyAllWindows()
-p.terminate()
+    socketio.run(app, debug=True, host='0.0.0.0')
+    
